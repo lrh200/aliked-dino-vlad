@@ -1,75 +1,49 @@
 from __future__ import print_function
-import argparse
-import math
 import os
 import sys
-from math import log10, ceil
-import random, shutil, json
-from os.path import join, exists, isfile, realpath, dirname
-from os import makedirs, remove
+import random
+import h5py
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader, SubsetRandomSampler, Subset
+from torch.utils.data import DataLoader
+from sklearn.cluster import KMeans
+from PIL import Image, ImageFile
 import torchvision.transforms as transforms
-from PIL import Image
-from datetime import datetime
-import h5py
-import faiss
-from tensorboardX import SummaryWriter
-import numpy as np
-from numpy import mean
-from collections import defaultdict
 import time
-from scipy.spatial import cKDTree
 
-import RankedListdataset
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # ==================== Configuration ====================
-threads = 12
 seed = 42
-batchSize = 5
-cacheBatchSize = 20
-cacheRefreshRate = 0
-margin = 0.1
-alpha = 1.35
-nGPU = 1
-LearnRateStep = 5
-LearnRateGamma = 0.5
-momentum = 0.9
-nEpochs = 20
-StartEpoch = 0
-evalEvery = 1
-patience = 0
-NewWidth = 480
-NewHeight = 320
-optimtype = "adam"
-LearnRate = 1e-5
-weightDecay = 5e-4
-
 num_clusters = 64
 max_keypoints = 1024
-losstype = "RankedList"
+num_samples = 10000  # Number of features to sample for clustering
 
 # Paths
 DatasetDir = "/home/member/chxm/lrh/UAVPairs/uavpairs"
-ProjectDir = "/home/member/chxm/lrh/UAVPairs"
 CheckpointsDir = "/home/member/chxm/lrh/UAVPairs/checkpoints"
 DatasetPath = os.path.join(DatasetDir, "trainset/images")
-TestDatasetPath = os.path.join(DatasetDir, "testset/images/cug/images")
-TrainMatPath = os.path.join(DatasetDir, "trainset/BatchedNontrivialSample_train2.mat")
-TestMatPath = os.path.join(DatasetDir, "trainset/test.mat")
 hdf5Path = os.path.join(CheckpointsDir, "centroids/ALIKED_DINO_VLAD_64_desc_cen.hdf5")
-runsPath = os.path.join(CheckpointsDir, "runs/")
-gt_test_file = os.path.join(DatasetDir, "trainset/true_pair_100.txt")
+
+NewWidth = 480
+NewHeight = 320
+
+
+# ==================== Import Modules ====================
+# Import from aliked_modules.py
+try:
+    from aliked_modules import get_patches, simple_nms, InputPadder, DKD, SDDH
+except ImportError:
+    print("Error: aliked_modules.py not found. Please ensure it's in the same directory.")
+    sys.exit(1)
 
 
 # ==================== ALIKED Feature Extractor ====================
 class ALIKED(nn.Module):
     def __init__(self, model_name="aliked-n16", max_num_keypoints=1024, detection_threshold=0.2):
         super().__init__()
-        from torchvision.models import resnet
         
         cfgs = {
             "aliked-n16": {"c1": 16, "c2": 32, "c3": 64, "c4": 128, "dim": 128, "K": 3, "M": 16},
@@ -81,7 +55,7 @@ class ALIKED(nn.Module):
         self.pool2 = nn.AvgPool2d(kernel_size=2, stride=2)
         self.pool4 = nn.AvgPool2d(kernel_size=4, stride=4)
         
-        # Encoder blocks (simplified)
+        # Encoder blocks
         self.block1 = nn.Sequential(
             nn.Conv2d(3, c1, 3, padding=1), nn.BatchNorm2d(c1), self.gate,
             nn.Conv2d(c1, c1, 3, padding=1), nn.BatchNorm2d(c1), self.gate
@@ -115,13 +89,11 @@ class ALIKED(nn.Module):
             nn.Conv2d(4, 1, 3, padding=1),
         )
         
-        from .aliked_modules import SDDH, DKD
         self.desc_head = SDDH(dim, K, M, gate=self.gate, conv2D=False, mask=False)
         self.dkd = DKD(radius=2, top_k=max_num_keypoints if detection_threshold <= 0 else -1,
                        scores_th=detection_threshold, n_limit=max_num_keypoints if max_num_keypoints > 0 else 20000)
 
     def extract_dense_map(self, image):
-        from .aliked_modules import InputPadder
         div_by = 32
         padder = InputPadder(image.shape[-2], image.shape[-1], div_by)
         image = padder.pad(image)
@@ -173,6 +145,7 @@ class DinoV2(nn.Module):
     def __init__(self, weights="dinov2_vits14", allow_resize=True):
         super().__init__()
         self.allow_resize = allow_resize
+        print(f"Loading DINOv2 model: {weights}")
         self.net = torch.hub.load("facebookresearch/dinov2", weights)
         self.vit_size = 14
         
@@ -228,541 +201,225 @@ class PointPatchFusion(nn.Module):
         return fused_features
 
 
-# ==================== VLAD Pooling ====================
-class VLADPooling(nn.Module):
-    """VLAD pooling for global descriptor aggregation"""
-    def __init__(self, num_clusters=64, dim=256):
-        super(VLADPooling, self).__init__()
-        self.num_clusters = num_clusters
-        self.dim = dim
-        
-        # Learnable cluster centers
-        self.centroids = nn.Parameter(torch.rand(num_clusters, dim))
-        
-        # Soft assignment layer
-        self.conv = nn.Linear(dim, num_clusters)
-        
-    def init_params(self, clsts, traindescs=None):
-        """Initialize cluster centers"""
-        self.centroids.data = torch.from_numpy(clsts).float()
-        
-        # Initialize soft assignment weights
-        clsts_normalized = clsts / (np.linalg.norm(clsts, axis=1, keepdims=True) + 1e-8)
-        self.conv.weight.data = torch.from_numpy(clsts_normalized).float()
-        self.conv.bias.data.zero_()
-        
-    def forward(self, x):
-        """
-        Args:
-            x: (N, dim) - local features
-        Returns:
-            vlad: (1, num_clusters * dim) - VLAD descriptor
-        """
-        N, D = x.shape
-        
-        # Normalize input
-        x = F.normalize(x, p=2, dim=1)
-        
-        # Soft assignment
-        soft_assign = self.conv(x)  # (N, num_clusters)
-        soft_assign = F.softmax(soft_assign, dim=1)
-        
-        # Calculate residuals
-        vlad = torch.zeros(self.num_clusters, D, device=x.device, dtype=x.dtype)
-        
-        for k in range(self.num_clusters):
-            residual = x - self.centroids[k:k+1]
-            weighted_residual = residual * soft_assign[:, k:k+1]
-            vlad[k] = weighted_residual.sum(dim=0)
-        
-        # Intra-normalization
-        vlad = F.normalize(vlad, p=2, dim=1)
-        
-        # Flatten and L2 normalize
-        vlad = vlad.view(-1)
-        vlad = F.normalize(vlad, p=2, dim=0)
-        
-        return vlad.unsqueeze(0)
-
-
-# ==================== Complete Model ====================
-class ALIKEDDinoVLAD(nn.Module):
-    """Complete (ALIKED + DINO) + VLAD model"""
-    def __init__(self, num_clusters=64, max_keypoints=1024):
-        super(ALIKEDDinoVLAD, self).__init__()
+# ==================== Feature Extraction Model ====================
+class FeatureExtractor(nn.Module):
+    """Extract fused features without VLAD pooling"""
+    def __init__(self, max_keypoints=1024):
+        super(FeatureExtractor, self).__init__()
         
         self.aliked = ALIKED(model_name="aliked-n16", max_num_keypoints=max_keypoints, detection_threshold=0.2)
         self.dino = DinoV2(weights="dinov2_vits14", allow_resize=True)
         self.fusion = PointPatchFusion(point_dim=128, patch_dim=384, output_dim=256)
-        self.vlad = VLADPooling(num_clusters=num_clusters, dim=256)
         
     def forward(self, x):
-        """
-        Args:
-            x: (B, 3, H, W) - batch of images
-        Returns:
-            global_descriptors: (B, num_clusters * dim) - batch of VLAD descriptors
-        """
         B = x.size(0)
         
         # Extract ALIKED features
         aliked_out = self.aliked({"image": x})
-        keypoints_batch = aliked_out["keypoints"]  # List of [N, 2]
-        descriptors_batch = aliked_out["descriptors"]  # List of [N, 128]
+        keypoints_batch = aliked_out["keypoints"]
+        descriptors_batch = aliked_out["descriptors"]
         
         # Extract DINOv2 features
         dino_out = self.dino({"image": x})
-        dino_features = dino_out["features"]  # [B, C, H, W]
+        dino_features = dino_out["features"]
         
-        global_descriptors = []
+        all_fused_features = []
         
         for i in range(B):
-            keypoints = keypoints_batch[i]  # [N, 2]
-            point_desc = descriptors_batch[i]  # [N, 128]
+            keypoints = keypoints_batch[i]
+            point_desc = descriptors_batch[i]
             
             # Sample DINOv2 features at keypoint locations
-            kp_batch = keypoints.unsqueeze(0)  # [1, N, 2]
-            dino_feat = dino_features[i:i+1]  # [1, C, H, W]
-            patch_desc = self.dino.sample_features(kp_batch, dino_feat)[0]  # [N, 384]
+            kp_batch = keypoints.unsqueeze(0)
+            dino_feat = dino_features[i:i+1]
+            patch_desc = self.dino.sample_features(kp_batch, dino_feat)[0]
             
             # Fuse features
             fused_features = self.fusion(point_desc, patch_desc)
-            
-            # VLAD pooling
-            global_desc = self.vlad(fused_features)
-            global_descriptors.append(global_desc)
+            all_fused_features.append(fused_features)
         
-        # Stack all descriptors
-        global_descriptors = torch.cat(global_descriptors, dim=0)
-        
-        return global_descriptors
+        return all_fused_features
 
 
-# ==================== Training Functions ====================
-def TrainOneEpochTriplet(epoch):
-    TrainData.GetDataType = 'RankedList'
-    epoch_loss = 0
-    startIter = 1
+def get_image_list(dataset_path, num_images=1000):
+    """Get list of training images"""
+    image_list = []
     
-    if cacheRefreshRate > 0:
-        subsetN = ceil(len(TrainData) / cacheRefreshRate)
-        subsetIdx = np.array_split(np.arange(len(TrainData)), subsetN)
-    else:
-        subsetN = 1
-        subsetIdx = [np.arange(len(TrainData))]
+    # Walk through the dataset directory
+    for root, dirs, files in os.walk(dataset_path):
+        for file in files:
+            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                image_list.append(os.path.join(root, file))
     
-    nBatches = (len(TrainData) + batchSize - 1) // batchSize
-    print("number of batches: ", nBatches)
-    print("Divide TrainData into", subsetN, "groups")
-
-    for subIter in range(subsetN):
-        print("Currently the number ", str(subIter + 1), "group of TrainData")
-
-        model.eval()
-        SubData = Subset(dataset=TrainData, indices=subsetIdx[subIter])
-        SubQueryDataLoader = DataLoader(
-            dataset=SubData,
-            num_workers=threads,
-            batch_size=batchSize,
-            shuffle=False,
-            collate_fn=RankedListdataset.collate_fn,
-            pin_memory=True
-        )
-        
-        model.train()
-        
-        for iteration, (query, positives, posCounts, index) in enumerate(SubQueryDataLoader, startIter):
-            if query is None:
-                continue
-            
-            B, C, H, W = query.shape
-            nPos = torch.sum(posCounts)
-            
-            input = torch.cat([query, positives])
-            input = input.to(device)
-            
-            # Forward pass through the model
-            vlad_encoding = model(input)
-            
-            vladQ, vladP = torch.split(vlad_encoding, [B, nPos])
-            
-            optimizer.zero_grad()
-            
-            loss = torch.tensor(0.0).to(device)
-            count = torch.tensor(0.0).to(device)
-            
-            for i, posCount in enumerate(posCounts):
-                for j in range(posCount):
-                    posIx = (torch.sum(posCounts[:i]) + j).item()
-                    for k in range(B):
-                        if k != i:
-                            for nj in range(posCounts[k]):
-                                negIx = (torch.sum(posCounts[:k]) + nj).item()
-                                loss_item = criterion(vladQ[i], vladP[posIx], vladP[negIx])
-                                if loss_item > 0:
-                                    loss += loss_item
-                                    count += 1
-            
-            loss /= (nPos * (nPos - int(nPos/B))).float().to(device)
-            loss /= (count + 1e-6).float().to(device)
-            
-            if loss <= 0:
-                continue
-                
-            loss.backward()
-            optimizer.step()
-            
-            del input, vlad_encoding, vladQ, vladP
-            del query, positives
-            
-            batch_loss = loss.item()
-            epoch_loss += batch_loss
-            
-            if iteration % 100 == 0 or nBatches <= 10:
-                print("==> Epoch[{}]({}/{}): Loss: {:.4f}".format(
-                    epoch, iteration, nBatches, batch_loss), flush=True)
-                writer.add_scalar('Train/Loss', batch_loss,
-                                ((epoch - 1) * nBatches) + iteration)
-
-        startIter += len(SubQueryDataLoader)
-        del SubQueryDataLoader, loss
-        optimizer.zero_grad()
-        torch.cuda.empty_cache()
-        TrainData.GetDataType = 'None'
-
-    avg_loss = epoch_loss / nBatches
-    print("===> Epoch {} Complete!  Avg. Loss: {:.4f}".format(epoch, avg_loss), flush=True)
-    writer.add_scalar('Train/AvgLoss', avg_loss, epoch)
-    return avg_loss
-
-
-def TrainOneEpoch(epoch):
-    TrainData.GetDataType = 'RankedList'
-    epoch_loss = 0
-    epoch_loss_p = 0
-    epoch_loss_n = 0
-    startIter = 1
+    print(f"Found {len(image_list)} total images")
     
-    if cacheRefreshRate > 0:
-        subsetN = ceil(len(TrainData) / cacheRefreshRate)
-        subsetIdx = np.array_split(np.arange(len(TrainData)), subsetN)
-    else:
-        subsetN = 1
-        subsetIdx = [np.arange(len(TrainData))]
+    # Sample random images if there are too many
+    if len(image_list) > num_images:
+        random.shuffle(image_list)
+        image_list = image_list[:num_images]
+        print(f"Sampled {num_images} images for clustering")
     
-    nBatches = (len(TrainData) + batchSize - 1) // batchSize
-    print("number of batches: ", nBatches)
-    print("Divide TrainData into", subsetN, "groups")
-
-    for subIter in range(subsetN):
-        print("Currently the number ", str(subIter + 1), "group of TrainData")
-        model.eval()
-
-        SubData = Subset(dataset=TrainData, indices=subsetIdx[subIter])
-        SubQueryDataLoader = DataLoader(
-            dataset=SubData,
-            num_workers=threads,
-            batch_size=batchSize,
-            shuffle=False,
-            collate_fn=RankedListdataset.collate_fn,
-            pin_memory=True
-        )
-        
-        model.train()
-        
-        for iteration, (query, positives, posCounts, index) in enumerate(SubQueryDataLoader, startIter):
-            if query is None:
-                continue
-            
-            B, C, H, W = query.shape
-            nPos = torch.sum(posCounts)
-            
-            input = torch.cat([query, positives])
-            input = input.to(device)
-            
-            # Forward pass
-            vlad_encoding = model(input)
-            
-            vladQ, vladP = torch.split(vlad_encoding, [B, nPos])
-            
-            optimizer.zero_grad()
-            
-            loss_p = torch.tensor(0.0).to(device)
-            loss_n = torch.tensor(0.0).to(device)
-            count_n = torch.tensor(0.0).to(device)
-            count_p = torch.tensor(0.0).to(device)
-            
-            for i, posCount in enumerate(posCounts):
-                for j in range(posCount):
-                    posIx = (torch.sum(posCounts[:i]) + j).item()
-                    dist_ap = pdist(vladQ[i], vladP[posIx])
-                    dist_aa = torch.zeros_like(dist_ap)
-                    y = torch.ones_like(dist_ap)
-                    loss_p_item = criterionP(dist_aa, dist_ap, y)
-                    if loss_p_item > 0:
-                        loss_p += loss_p_item
-                        count_p += 1
-
-                    for k in range(B):
-                        if k != i:
-                            dist_an = pdist(vladQ[k], vladP[posIx])
-                            dist_aa = torch.zeros_like(dist_an)
-                            y = torch.ones_like(dist_an)
-                            loss_n_item = criterionN(dist_an, dist_aa, y)
-                            if loss_n_item > 0:
-                                loss_n += loss_n_item
-                                count_n += 1
-
-            loss_p /= (count_p + 1e-6).float().to(device)
-            loss_n /= (count_n + 1e-6).float().to(device)
-            loss = loss_p + loss_n
-
-            if loss <= 0:
-                continue
-            loss.backward()
-            optimizer.step()
-
-            del input, vlad_encoding, vladQ, vladP
-            del query, positives
-
-            batch_loss = loss.item()
-            batch_loss_n = loss_n.item()
-            batch_loss_p = loss_p.item()
-
-            epoch_loss += batch_loss
-            epoch_loss_n += batch_loss_n
-            epoch_loss_p += batch_loss_p
-
-            if iteration % 100 == 0 or nBatches <= 10:
-                print("==> Epoch[{}]({}/{}): Loss: {:.4f}, Loss_p: {:.4f}, Loss_n: {:.4f}".format(
-                    epoch, iteration, nBatches, batch_loss, batch_loss_p, batch_loss_n), flush=True)
-                writer.add_scalar('Train/Loss', batch_loss,
-                                ((epoch - 1) * nBatches) + iteration)
-
-        startIter += len(SubQueryDataLoader)
-        del SubQueryDataLoader, loss_p, loss_n, loss
-        optimizer.zero_grad()
-        torch.cuda.empty_cache()
-        TrainData.GetDataType = 'None'
-
-    avg_loss = epoch_loss / nBatches
-    avg_loss_p = epoch_loss_p / nBatches
-    avg_loss_n = epoch_loss_n / nBatches
-    print("===> Epoch {} Complete!  Avg. Loss: {:.4f}, Loss_p: {:.4f}, Loss_n: {:.4f}".format(
-        epoch, avg_loss, avg_loss_p, avg_loss_n), flush=True)
-    writer.add_scalar('Train/AvgLoss', avg_loss, epoch)
-    return avg_loss
+    return image_list
 
 
-def Validate_campus(TestData, epoch=0, write_tboard=False):
-    time1 = time.time()
+def extract_features(model, image_list, device, batch_size=4):
+    """Extract fused features from images"""
     model.eval()
-
-    QueryFeat = torch.zeros(0).to(device)
-
-    TestData.GetDataType = 'TestQuery'
-    Databaseloader = DataLoader(
-        dataset=TestData,
-        num_workers=8,
-        batch_size=5,
-        shuffle=False,
-        pin_memory=True
-    )
     
+    all_features = []
+    
+    transform = transforms.Compose([
+        transforms.Resize((NewHeight, NewWidth)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                           std=[0.229, 0.224, 0.225])
+    ])
+    
+    print(f"\n===> Extracting features from {len(image_list)} images...")
     with torch.no_grad():
-        for iteration, (QueryImg, Index) in enumerate(Databaseloader, 1):
-            QueryImg = QueryImg.to(device)
-            QueryFeat_batch = model(QueryImg)
-            QueryFeat = torch.cat((QueryFeat, QueryFeat_batch), 0)
-
-    QueryFeat = QueryFeat.cpu().detach().numpy()
-    print(QueryFeat.shape)
+        for i in range(0, len(image_list), batch_size):
+            batch_images = []
+            batch_end = min(i + batch_size, len(image_list))
+            
+            if (i // batch_size) % 10 == 0:
+                print(f"Processing batch {i//batch_size + 1}/{(len(image_list) + batch_size - 1)//batch_size}")
+            
+            for img_path in image_list[i:batch_end]:
+                try:
+                    img = Image.open(img_path)
+                    if len(img.split()) != 3:
+                        img = img.convert('RGB')
+                    img_tensor = transform(img)
+                    batch_images.append(img_tensor)
+                except Exception as e:
+                    print(f"Error loading {img_path}: {e}")
+                    continue
+            
+            if len(batch_images) == 0:
+                continue
+            
+            batch_tensor = torch.stack(batch_images).to(device)
+            
+            # Extract fused features
+            try:
+                fused_features_batch = model(batch_tensor)
+                
+                # Collect all features
+                for fused_features in fused_features_batch:
+                    all_features.append(fused_features.cpu().numpy())
+            except Exception as e:
+                print(f"Error processing batch {i//batch_size + 1}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
     
-    test_dict = defaultdict(list)
-    gt_dict = defaultdict(list)
+    return all_features
 
-    netvlad_index = faiss.IndexFlatL2(faiss_dim)
-    netvlad_index.add(QueryFeat)
 
-    num_test = 0
-    D, I = netvlad_index.search(QueryFeat, 31)
-    del QueryFeat
+def perform_clustering(features_list, num_clusters, num_samples):
+    """Perform k-means clustering on sampled features"""
+    print(f"\n===> Collecting features for clustering...")
     
-    for index, values in enumerate(I):
-        im1 = TestData.TestDatabase[index].replace(TestDatasetPath + "\\", '')
-        for value in values[1:]:
-            im2 = TestData.TestDatabase[value].replace(TestDatasetPath + "\\", '')
-            test_dict[im1].append(im2)
-            num_test = num_test + 1
-
-    with open(gt_test_file, 'r') as lines:
-        for line in lines:
-            line = line.strip('\n')
-            strs = line.split(" ")
-            gt_dict[strs[0]].append(strs[1])
-            gt_dict[strs[1]].append(strs[0])
-
-    global_num = 0
-    for key in test_dict:
-        set_c = set(test_dict[key]) & set(gt_dict[key])
-        list_c = list(set_c)
-        local_num = len(list_c)
-        global_num = global_num + local_num
-    mAP = global_num / (num_test * 1.0)
-
-    print("-------------------------------")
-    print("===> global_num: {}".format(global_num))
-    print("====> mAP: {:.5f}".format(mAP))
-    time2 = time.time()
-    print(time2-time1)
-    print("-------------------------------")
-    torch.cuda.empty_cache()
-    return mAP
-
-
-def save_checkpoint(state, is_best, filename):
-    model_out_path = join(savePath, filename)
-    torch.save(state, model_out_path)
-    if is_best:
-        shutil.copyfile(model_out_path, join(savePath, 'model_best.pth.tar'))
+    # Flatten all features
+    all_features = []
+    for feat in features_list:
+        all_features.append(feat)
+    
+    all_features = np.vstack(all_features)
+    print(f"Total features collected: {all_features.shape}")
+    
+    # Sample features if there are too many
+    if all_features.shape[0] > num_samples:
+        print(f"Sampling {num_samples} features from {all_features.shape[0]}")
+        indices = np.random.choice(all_features.shape[0], num_samples, replace=False)
+        sampled_features = all_features[indices]
+    else:
+        sampled_features = all_features
+        print(f"Using all {all_features.shape[0]} features for clustering")
+    
+    print(f"Sampled features shape: {sampled_features.shape}")
+    
+    # Perform k-means clustering
+    print(f"\n===> Performing k-means clustering with {num_clusters} clusters...")
+    print("This may take a few minutes...")
+    kmeans = KMeans(n_clusters=num_clusters, random_state=seed, n_init=10, verbose=1, max_iter=300)
+    kmeans.fit(sampled_features)
+    
+    centroids = kmeans.cluster_centers_
+    print(f"Centroids shape: {centroids.shape}")
+    print(f"Clustering inertia: {kmeans.inertia_:.2f}")
+    
+    return centroids, sampled_features
 
 
-# ==================== Main Training Script ====================
+def save_clusters(centroids, descriptors, output_path):
+    """Save cluster centers and descriptors to HDF5 file"""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    with h5py.File(output_path, 'w') as h5:
+        h5.create_dataset('centroids', data=centroids)
+        h5.create_dataset('descriptors', data=descriptors)
+    
+    print(f"\n===> Cluster centers saved to: {output_path}")
+
+
 if __name__ == '__main__':
-    print("Model: ALIKED+DINO+VLAD")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    time1 = time.time()
+    
+    print("=" * 80)
+    print("ALIKED+DINO+VLAD Clustering Script")
+    print("=" * 80)
+    
+    # Set random seeds
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-
-    print('===> Loading training dataset(s)...')
-    TrainData = RankedListdataset.Dataset(TrainMatPath, DatasetPath, True)
-    TrainDataLoader = DataLoader(
-        dataset=TrainData,
-        num_workers=threads,
-        batch_size=cacheBatchSize,
-        shuffle=False,
-        pin_memory=True
-    )
-
-    TestData = RankedListdataset.Dataset(TestMatPath, TestDatasetPath, False)
-    TestDataLoader = DataLoader(
-        dataset=TestData,
-        num_workers=threads,
-        batch_size=cacheBatchSize,
-        shuffle=False,
-        pin_memory=True
-    )
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
     
-    print('Number of original triples:', len(TrainData.Query))
-    print('Number of triples after filtering:', len(TrainData))
-    print('Number of database images:', len(TrainData.Database))
-
-    print('===> Building ALIKED+DINO+VLAD model...')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     
-    model = ALIKEDDinoVLAD(num_clusters=num_clusters, max_keypoints=max_keypoints)
-    
-    # Load VLAD cluster centers if available
-    if os.path.exists(hdf5Path):
-        print(f"Loading cluster centers from {hdf5Path}")
-        with h5py.File(hdf5Path, mode='r') as h5:
-            clsts = h5.get("centroids")[...]
-            model.vlad.init_params(clsts)
-            del clsts
-    else:
-        print(f"Warning: Cluster centers not found at {hdf5Path}")
-        print("Please run clustering first!")
-        # You can still train, but clustering should be done for better results
-
+    # Build feature extraction model
+    print("\n===> Building feature extraction model...")
+    model = FeatureExtractor(max_keypoints=max_keypoints)
     model = model.to(device)
-    print("Network Structure:")
-    print(model)
+    model.eval()
+    print("Model built successfully!")
     
-    # Calculate output dimension
-    faiss_dim = num_clusters * 256  # VLAD output dimension
-
-    # Define optimizer
-    parameters = filter(lambda p: p.requires_grad, model.parameters())
+    # Get training images
+    print("\n===> Collecting training images...")
+    image_list = get_image_list(DatasetPath, num_images=1000)
     
-    if optimtype == 'sgd':
-        optimizer = optim.SGD(parameters, LearnRate, momentum=momentum, weight_decay=weightDecay)
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=LearnRateStep, gamma=LearnRateGamma)
-    elif optimtype == 'adam':
-        optimizer = optim.Adam(parameters, LearnRate, weight_decay=weightDecay)
-        exp_decay = math.exp(-0.1)
-        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=exp_decay)
-
-    # Define loss functions
-    if losstype == "Triplet":
-        criterion = nn.TripletMarginLoss(margin=margin, p=2, reduction='sum').to(device)
-    else:
-        criterionP = nn.MarginRankingLoss(margin=margin-alpha, reduction='none').to(device)
-        criterionN = nn.MarginRankingLoss(margin=alpha, reduction='none').to(device)
-        pdist = nn.PairwiseDistance(p=2)
-
-    print('===> Training model...')
-
-    OutputFile = "ALIKED_DINO_VLAD.txt"
-    with open(OutputFile, 'a') as Output:
-        Output.write("ALIKED_DINO_VLAD\n")
+    if len(image_list) == 0:
+        print("Error: No images found in dataset path!")
+        sys.exit(1)
     
-    writer = SummaryWriter(
-        log_dir=join(runsPath, datetime.now().strftime('%b%d_%H-%M-%S') + '_ALIKED_DINO_VLAD')
-    )
-    logdir = writer.file_writer.get_logdir()
-    savePath = join(logdir, "checkpoints")
+    # Extract features
+    features_list = extract_features(model, image_list, device, batch_size=4)
     
-    if os.path.exists(savePath):
-        shutil.rmtree(savePath)
-    makedirs(savePath)
-
-    BestmAP = 0
-
-    # Initial validation
-    mAP = Validate_campus(TestData, 0, write_tboard=True)
-    with open(OutputFile, 'a') as Output:
-        Output.write(str(0) + "\t" + str(alpha-margin) + "\t" + str(mAP) + "\n")
+    if len(features_list) == 0:
+        print("Error: No features extracted!")
+        sys.exit(1)
     
-    CheckPointFile = "CheckPoint_ALIKED_DINO_VLAD_" + str(0) + ".pth.tar"
-    save_checkpoint({
-        'epoch': 0,
-        'state_dict': model.state_dict(),
-        'mAP': mAP,
-        'best_score': mAP,
-        'optimizer': optimizer.state_dict(),
-        'parallel': False,
-    }, False, CheckPointFile)
-
-    # Training loop
-    for epoch in range(StartEpoch + 1, nEpochs + 1):
-        if losstype == "Triplet":
-            AveLoss = TrainOneEpochTriplet(epoch)
-        else:
-            AveLoss = TrainOneEpoch(epoch)
-        
-        scheduler.step(epoch)
-        mAP = Validate_campus(TestData, epoch, write_tboard=True)
-        
-        if mAP > BestmAP:
-            BestmAP = mAP
-            IsBestFlag = True
-        else:
-            IsBestFlag = False
-
-        with open(OutputFile, 'a') as Output:
-            Output.write(str(epoch) + "\t" + str(AveLoss) + "\t" + str(mAP) + "\n")
-        
-        CheckPointFile = "CheckPoint_ALIKED_DINO_VLAD_" + str(epoch) + ".pth.tar"
-        save_checkpoint({
-            'epoch': epoch,
-            'state_dict': model.state_dict(),
-            'mAP': mAP,
-            'best_score': BestmAP,
-            'optimizer': optimizer.state_dict(),
-            'parallel': False,
-        }, IsBestFlag, CheckPointFile)
-
-    print("Training completed!")
-    writer.close()
+    print(f"\nExtracted features from {len(features_list)} images")
+    
+    # Perform clustering
+    try:
+        centroids, descriptors = perform_clustering(features_list, num_clusters, num_samples)
+    except Exception as e:
+        print(f"Error during clustering: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # Save cluster centers
+    save_clusters(centroids, descriptors, hdf5Path)
+    
+    time2 = time.time()
+    print(f"\n===> Total time: {time2-time1:.2f} seconds")
+    print("=" * 80)
+    print("Clustering completed successfully!")
+    print(f"Cluster file: {hdf5Path}")
+    print("You can now run the training script.")
+    print("=" * 80)
